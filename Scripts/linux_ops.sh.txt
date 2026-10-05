@@ -1,0 +1,418 @@
+#!/bin/bash
+
+# ==========================================
+# Linux Operations & Self-Healing Tool
+# ==========================================
+
+PROJECT_DIR="/opt/linux-ops"
+LOG_DIR="$PROJECT_DIR/logs"
+REPORT_DIR="$PROJECT_DIR/reports"
+
+LOG_FILE="$LOG_DIR/linux_ops.log"
+REPORT_FILE="$REPORT_DIR/health_report.txt"
+
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+mkdir -p "$LOG_DIR" "$REPORT_DIR"
+
+# ==========================================
+# Logging Function
+# ==========================================
+
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# ==========================================
+# Header Function
+# ==========================================
+
+print_header() {
+    echo "=========================================="
+    echo " Linux Production Health Check"
+    echo "=========================================="
+    echo "Hostname : $(hostname)"
+    echo "Time     : $TIMESTAMP"
+    echo "=========================================="
+}
+
+# ==========================================
+# Status Function
+# ==========================================
+
+print_status() {
+    local service="$1"
+    local status="$2"
+
+    printf "%-20s : %s\n" "$service" "$status"
+}
+
+# ==========================================
+# Resource Monitoring
+# ==========================================
+
+check_resources() {
+
+    echo
+    echo "========== RESOURCE STATUS =========="
+
+    CPU_LOAD=$(awk '{print $1}' /proc/loadavg)
+    echo "CPU Load            : $CPU_LOAD"
+
+    MEMORY_USAGE=$(free | awk '/Mem:/ {printf "%.0f", $3/$2 * 100}')
+    echo "Memory Usage        : ${MEMORY_USAGE}%"
+
+    DISK_USAGE=$(df / | awk 'NR==2 {print $5}')
+    echo "Root Disk Usage     : $DISK_USAGE"
+
+    DISK_VALUE=${DISK_USAGE%\%}
+
+    if [ "$DISK_VALUE" -ge 90 ]; then
+        log_message "CRITICAL: Root disk usage is $DISK_USAGE"
+        echo "Disk Status         : CRITICAL"
+
+    elif [ "$DISK_VALUE" -ge 80 ]; then
+        log_message "WARNING: Root disk usage is $DISK_USAGE"
+        echo "Disk Status         : WARNING"
+
+    else
+        echo "Disk Status         : OK"
+    fi
+}
+
+# ==========================================
+# Self-Healing Function
+# ==========================================
+
+attempt_recovery() {
+
+    local service="$1"
+
+    echo "Recovery            : Attempting restart of $service"
+
+    log_message "Recovery started for $service"
+
+    if sudo systemctl restart "$service"; then
+
+        sleep 2
+
+        if systemctl is-active --quiet "$service"; then
+            print_status "$service" "RECOVERED"
+            log_message "SUCCESS: $service recovered successfully"
+        else
+            print_status "$service" "RECOVERY FAILED"
+            log_message "FAILED: $service did not recover"
+        fi
+
+    else
+        print_status "$service" "RESTART FAILED"
+        log_message "FAILED: Could not restart $service"
+    fi
+}
+
+# ==========================================
+# Service Check Function
+# ==========================================
+
+check_service() {
+
+    local service="$1"
+
+    if ! systemctl list-unit-files | grep -q "^${service}.service"; then
+        print_status "$service" "NOT INSTALLED"
+        log_message "$service is not installed"
+        return
+    fi
+
+    if systemctl is-active --quiet "$service"; then
+
+        print_status "$service" "OK"
+
+    else
+
+        print_status "$service" "CRITICAL"
+
+        log_message "CRITICAL: $service is not running"
+
+        attempt_recovery "$service"
+    fi
+}
+
+# ==========================================
+# Critical Services Monitoring
+# ==========================================
+
+check_services() {
+
+    echo
+    echo "========== SERVICE STATUS =========="
+
+    check_service "httpd"
+    check_service "named"
+    check_service "vsftpd"
+    check_service "chronyd"
+}
+
+# ==========================================
+# DNS Health Check
+# ==========================================
+
+check_dns() {
+
+    echo
+    echo "========== DNS HEALTH =========="
+
+    if systemctl is-active --quiet named; then
+        echo "DNS Service        : OK"
+    else
+        echo "DNS Service        : CRITICAL"
+        log_message "CRITICAL: DNS service is not running"
+        return
+    fi
+
+    if ss -lntup | grep -q ':53'; then
+        echo "DNS Port 53        : LISTENING"
+    else
+        echo "DNS Port 53        : NOT LISTENING"
+        log_message "CRITICAL: DNS port 53 is not listening"
+        return
+    fi
+
+    if dig localhost +short >/dev/null 2>&1; then
+        echo "DNS Query          : OK"
+        log_message "DNS health check passed"
+    else
+        echo "DNS Query          : FAILED"
+        log_message "CRITICAL: DNS query failed"
+    fi
+}
+
+# ==========================================
+# HTTP Health Check
+# ==========================================
+
+check_web() {
+
+    echo
+    echo "========== HTTP HEALTH =========="
+
+    if systemctl is-active --quiet httpd; then
+        echo "HTTP Service       : OK"
+    else
+        echo "HTTP Service       : CRITICAL"
+        log_message "CRITICAL: Apache httpd is not running"
+        return
+    fi
+
+    if ss -lntp | grep -q ':80'; then
+        echo "HTTP Port 80       : LISTENING"
+    else
+        echo "HTTP Port 80       : NOT LISTENING"
+        log_message "CRITICAL: HTTP port 80 is not listening"
+        return
+    fi
+
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost)
+
+    if [ "$HTTP_CODE" = "200" ]; then
+        echo "HTTP Response      : 200 OK"
+        log_message "HTTP health check passed"
+    else
+        echo "HTTP Response      : $HTTP_CODE"
+        log_message "WARNING: HTTP returned status $HTTP_CODE"
+    fi
+}
+
+# ==========================================
+# Log Monitoring
+# ==========================================
+
+check_logs() {
+
+    echo
+    echo "========== LOG MONITORING =========="
+
+    LOG_ERRORS=$(journalctl -p err -n 10 --no-pager 2>/dev/null)
+
+    if [ -z "$LOG_ERRORS" ]; then
+        echo "Recent Errors      : NONE"
+        log_message "No recent critical errors detected"
+    else
+        echo "Recent Errors      : DETECTED"
+        echo "$LOG_ERRORS" | tail -5
+        log_message "WARNING: Recent system errors detected"
+    fi
+
+    echo
+    echo "Log Directory Size : $(du -sh /var/log 2>/dev/null | awk '{print $1}')"
+}
+
+# ==========================================
+# FTP Health Check
+# ==========================================
+
+check_ftp() {
+
+    echo
+    echo "========== FTP HEALTH =========="
+
+    if systemctl is-active --quiet vsftpd; then
+        echo "FTP Service        : OK"
+    else
+        echo "FTP Service        : CRITICAL"
+        log_message "CRITICAL: FTP service is not running"
+        return
+    fi
+
+    if ss -lntp | grep -q ':21'; then
+        echo "FTP Port 21        : LISTENING"
+        log_message "FTP health check passed"
+    else
+        echo "FTP Port 21        : NOT LISTENING"
+        log_message "CRITICAL: FTP port 21 is not listening"
+    fi
+}
+
+# ==========================================
+# Time Synchronization Check
+# ==========================================
+
+check_time() {
+
+    echo
+    echo "========== TIME SYNC =========="
+
+    if systemctl is-active --quiet chronyd; then
+        echo "Chrony Service     : OK"
+    else
+        echo "Chrony Service     : CRITICAL"
+        log_message "CRITICAL: Chrony service is not running"
+        return
+    fi
+
+    if chronyc tracking >/dev/null 2>&1; then
+        echo "Time Sync          : OK"
+        log_message "Time synchronization check passed"
+    else
+        echo "Time Sync          : FAILED"
+        log_message "WARNING: Time synchronization check failed"
+    fi
+}
+
+# ==========================================
+# Network Health Check
+# ==========================================
+
+check_network() {
+
+    echo
+    echo "========== NETWORK HEALTH =========="
+
+    DEFAULT_GW=$(ip route | awk '/default/ {print $3; exit}')
+
+    if [ -z "$DEFAULT_GW" ]; then
+        echo "Default Gateway    : NOT FOUND"
+        log_message "CRITICAL: Default gateway not found"
+        return
+    else
+        echo "Default Gateway    : $DEFAULT_GW"
+    fi
+
+    if ping -c 2 -W 2 "$DEFAULT_GW" >/dev/null 2>&1; then
+        echo "Gateway Ping       : OK"
+    else
+        echo "Gateway Ping       : FAILED"
+        log_message "CRITICAL: Gateway is unreachable"
+        return
+    fi
+
+    if ping -c 2 -W 2 8.8.8.8 >/dev/null 2>&1; then
+        echo "Internet Ping      : OK"
+        log_message "Network health check passed"
+    else
+        echo "Internet Ping      : FAILED"
+        log_message "WARNING: Internet connectivity failed"
+    fi
+}
+
+check_file_security() {
+    echo
+    echo "======== FILE SECURITY ========"
+
+    if [ -d "/mydata" ]; then
+        echo "Directory            : /mydata EXISTS"
+
+        OWNER=$(stat -c '%U' /mydata)
+        GROUP=$(stat -c '%G' /mydata)
+        PERMISSIONS=$(stat -c '%a' /mydata)
+        SELINUX_CONTEXT=$(ls -Zd /mydata | awk '{print $4}')
+
+        echo "Owner                : $OWNER"
+        echo "Group                : $GROUP"
+        echo "Permissions          : $PERMISSIONS"
+        echo "SELinux Context      : $SELINUX_CONTEXT"
+
+        log_message "File security check completed for /mydata"
+    else
+        echo "Directory            : /mydata NOT FOUND"
+        log_message "WARNING: /mydata directory not found"
+    fi
+}
+check_security() {
+    echo
+    echo "======== SECURITY CHECK ========"
+
+    # Firewall check
+    if sudo firewall-cmd --state 2>/dev/null | grep -q "running"; then
+        echo "Firewall             : RUNNING"
+        log_message "Firewall is running"
+    else
+        echo "Firewall             : NOT RUNNING"
+        log_message "WARNING: Firewall is not running"
+    fi
+
+    # SELinux check
+    SELINUX_STATUS=$(getenforce 2>/dev/null)
+
+    if [ "$SELINUX_STATUS" = "Enforcing" ]; then
+        echo "SELinux              : ENFORCING"
+        log_message "SELinux is enforcing"
+    else
+        echo "SELinux              : $SELINUX_STATUS"
+        log_message "WARNING: SELinux is not enforcing"
+    fi
+}
+
+
+# ==========================================
+# Main Program
+# ==========================================
+
+log_message "Linux Operations Tool started."
+
+print_header
+
+check_resources
+
+check_services
+
+check_dns
+
+check_web
+
+check_logs
+
+check_ftp
+
+check_time
+
+check_network
+check_file_security
+check_security
+echo
+echo "System health check completed."
+
+log_message "System health check completed."
+
+exit 0
+
